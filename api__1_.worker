@@ -2,8 +2,11 @@
 // 超高速インメモリ ＆ ハンドル永久キャッシュ (0ms即引き)
 // =======================================================
 const MEMORY_CACHE = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10分間キャッシュ
+const CACHE_TTL_MS = 10 * 60 * 1000;   // 10分間は「新鮮」として即返却
+const STALE_MAX_MS = 60 * 60 * 1000;   // 期限切れでも60分までは古いデータを即返却し、裏で更新 (stale-while-revalidate)
 const CHANNEL_ID_CACHE = new Map();
+const REFRESHING = new Set();          // 裏更新中のキー (二重更新防止)
+let CACHE_ORIGIN = "https://cache.local"; // エッジキャッシュ用キーのオリジン (リクエストごとに更新)
 
 function getCached(key) {
   const item = MEMORY_CACHE.get(key);
@@ -13,7 +16,17 @@ function getCached(key) {
   return null;
 }
 
+// 期限切れ (でも STALE_MAX_MS 以内) のデータ。新鮮なものが無いときだけ使う
+function getStale(key) {
+  const item = MEMORY_CACHE.get(key);
+  if (item && Date.now() - item.time < STALE_MAX_MS) {
+    return item.data;
+  }
+  return null;
+}
+
 function setCache(key, data) {
+  MEMORY_CACHE.delete(key); // 再設定したキーを「最新」として末尾へ
   if (MEMORY_CACHE.size > 800) {
     const firstKey = MEMORY_CACHE.keys().next().value;
     MEMORY_CACHE.delete(firstKey);
@@ -29,6 +42,7 @@ function getSearchContinuationKey(token) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    CACHE_ORIGIN = url.origin;
 
     // --- 全レスポンス nocookie & CORS & キャッシュヘッダー ---
     const corsHeaders = {
@@ -56,10 +70,16 @@ export default {
     const query = url.searchParams.get("q") || url.searchParams.get("search");
     const isTrending = url.searchParams.has("trending") || path.startsWith("/api/v1/trending");
     const trendType = url.searchParams.get("type") || "default";
-    
+
     const tab = (url.searchParams.get("tab") || "videos").toLowerCase();
     const sort = (url.searchParams.get("sort") || "latest").toLowerCase();
-    const limit = Math.min(parseInt(url.searchParams.get("limit") || "30", 10), 60);
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "30", 10) || 30, 60);
+
+    // ★ ショート専用パラメータ: 件数 (最大120) / 最大秒数 (既定60秒=「1分」)
+    const shortsLimit = Math.max(1, Math.min(parseInt(url.searchParams.get("limit") || String(SHORTS_DEFAULT_LIMIT), 10) || SHORTS_DEFAULT_LIMIT, SHORTS_MAX_LIMIT));
+    const maxSecondsRaw = parseInt(url.searchParams.get("maxSeconds") || url.searchParams.get("maxLength") || "", 10);
+    const shortsMaxSeconds = maxSecondsRaw > 0 ? Math.min(maxSecondsRaw, 180) : SHORTS_MAX_SECONDS;
+    const shortsOnlySearch = ["shorts", "short"].includes(trendType.toLowerCase());
 
     let continuation = url.searchParams.get("continuation") || url.searchParams.get("token") || null;
     if (continuation) {
@@ -78,6 +98,19 @@ export default {
     if (channelMatch) channelId = channelMatch[1];
     const playlistMatch = path.match(/^\/api\/v1\/playlists\/([^\/?#]+)/);
     if (playlistMatch) playlistId = playlistMatch[1];
+
+    const isShortsRequest = !!(shortId || isShortsRoot || url.searchParams.has("shorts") || url.searchParams.has("short"));
+
+    // ★ デモUI: APIパラメータの無いブラウザアクセスは、キャッシュ(JSON)より「先に」HTMLを返す
+    //   (以前は先に / をJSONで叩かれると、そのJSONが10分キャッシュされ、ブラウザでもJSONが表示されていた)
+    const acceptsHtml = (request.headers.get("Accept") || "").includes("text/html");
+    const isApiRequest = !!(isTrending || isShortsRequest || commentsVideoId || videoId || channelId ||
+      playlistId || query || continuation || path.startsWith("/api/v1/search"));
+    if (request.method === "GET" && acceptsHtml && !isApiRequest) {
+      return new Response(renderDemoHtml(url.origin), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" }
+      });
+    }
 
     // ★ 1. 検索追加読み込みの超高速判定 (先読みキャッシュが存在すれば 0ms で即返却)
     if (continuation && (path.startsWith("/api/v1/search") || (!channelId && !commentsVideoId))) {
@@ -106,17 +139,29 @@ export default {
       return edgeCached;
     }
 
-    try {
+    // ★ レスポンス生成 (キャッシュ保存可否も返す)
+    const compute = async () => {
       let responseData = null;
+      let cacheable = true;
 
       // 1. トレンド
       if (isTrending) {
         responseData = await fetchTrendingVideosReliable(trendType);
       }
-      // 2. ショート動画 (全部 nocookie ＆ 自動再生)
-      else if (shortId || isShortsRoot || url.searchParams.has("shorts") || url.searchParams.has("short")) {
-        const targetId = shortId || await getInitialShortIdFast();
-        responseData = await fetchFastShortWith3Next(targetId);
+      // 2. ショート動画 (本物のShortsだけ ＆ 大量 ＆ 最速 / 全部 nocookie ＆ 自動再生)
+      else if (isShortsRequest) {
+        const targetId = shortId || await getShortsSeed();
+        const pageKey = continuation ? shortsPageKey(continuation, shortsLimit, shortsMaxSeconds) : null;
+        const prefetched = pageKey ? getCached(pageKey) : null; // 先読み済みの次ページなら 0ms
+        responseData = prefetched || await fetchShortsFeed(targetId, {
+          limit: shortsLimit, continuation, maxSeconds: shortsMaxSeconds, ctx
+        });
+        // 次ページを裏で先読み
+        if (responseData.continuation) {
+          triggerShortsPrefetch(ctx, targetId, responseData.continuation, shortsLimit, shortsMaxSeconds);
+        }
+        // 一時的な失敗 (空) を10分キャッシュしない
+        if (!responseData.sequence || responseData.sequence.length === 0) cacheable = false;
       }
       // 3. コメント単体取得 (追加読み込み対応)
       else if (commentsVideoId || (continuation && path.includes("/comments"))) {
@@ -134,29 +179,28 @@ export default {
       else if (playlistId) {
         responseData = await fetchInvidiousPlaylist(playlistId, limit);
       }
-      // ★ 7. 検索 (追加読み込み爆速化 ＆ 無限連鎖プリフェッチ)
+      // ★ 7. 検索 (追加読み込み爆速化 ＆ 無限連鎖プリフェッチ / type=shorts でShortsだけ)
       else if (query || continuation || path.startsWith("/api/v1/search")) {
-        responseData = await fetchFastSearch(query || "", limit, continuation);
+        if (shortsOnlySearch) {
+          responseData = await fetchShortsSearch(query || "#shorts", shortsLimit, continuation, shortsMaxSeconds);
+        } else {
+          responseData = await fetchFastSearch(query || "", limit, continuation);
 
-        // 次ページのトークンがあれば裏で先読みしてエッジキャッシュに事前保存 (0ms応答化)
-        if (responseData.continuation) {
-          triggerSearchPrefetch(ctx, url.origin, responseData.continuation, limit, corsHeaders);
+          // 次ページのトークンがあれば裏で先読みしてエッジキャッシュに事前保存 (0ms応答化)
+          if (responseData.continuation) {
+            triggerSearchPrefetch(ctx, url.origin, responseData.continuation, limit, corsHeaders);
+          }
         }
-      }
-      // デモ UI
-      else if (request.headers.get("Accept")?.includes("text/html")) {
-        return new Response(renderDemoHtml(url.origin), {
-          headers: { "Content-Type": "text/html; charset=utf-8" }
-        });
       }
       else {
         responseData = {
           status: "ready",
           api: "Invidious Ultra Turbo Engine v18 (Lightning Search & Auto-Loaded Watch)",
           endpoints: [
-            "/api/v1/search?q=:query",
+            "/api/v1/search?q=:query (&type=shorts でShortsだけ)",
             "/api/v1/channels/:id?tab=(videos|shorts|playlists|home)&sort=(latest|popular|oldest)",
-            "/api/v1/shorts/:id",
+            "/api/v1/shorts/:id?limit=(1-120)&maxSeconds=60&continuation=:token (本物のShortsだけ・大量・最速)",
+            "/api/v1/shorts (おすすめShorts)",
             "/api/v1/videos/:id (目安3秒・コメント自動同梱)",
             "/api/v1/comments/:id",
             "/api/v1/playlists/:id",
@@ -165,19 +209,47 @@ export default {
         };
       }
 
-      setCache(cacheKey, responseData);
-      const res = new Response(JSON.stringify(responseData), { headers: corsHeaders });
-      
-      if (request.method === "GET") {
-        ctx.waitUntil(cache.put(cacheUrl.toString(), res.clone()));
-      }
+      return { responseData, cacheable };
+    };
 
+    // メモリ + エッジに保存
+    const store = (responseData) => {
+      setCache(cacheKey, responseData);
+      if (request.method === "GET") {
+        const res = new Response(JSON.stringify(responseData), { headers: corsHeaders });
+        ctx.waitUntil(cache.put(cacheUrl.toString(), res).catch(() => {}));
+      }
+    };
+
+    // ★ stale-while-revalidate: 期限切れでも古いデータを 0ms で返し、裏で最新化
+    const staleData = request.method === "GET" ? getStale(cacheKey) : null;
+    if (staleData) {
+      if (!REFRESHING.has(cacheKey)) {
+        REFRESHING.add(cacheKey);
+        ctx.waitUntil((async () => {
+          try {
+            const r = await compute();
+            if (r.cacheable) store(r.responseData);
+          } catch (e) {
+          } finally {
+            REFRESHING.delete(cacheKey);
+          }
+        })());
+      }
+      return new Response(JSON.stringify(staleData), { headers: corsHeaders });
+    }
+
+    try {
+      const { responseData, cacheable } = await compute();
+      const headers = cacheable ? corsHeaders : { ...corsHeaders, "Cache-Control": "no-store" };
+      const res = new Response(JSON.stringify(responseData), { headers });
+      if (cacheable) store(responseData);
       return res;
 
     } catch (e) {
       return new Response(
         JSON.stringify({ error: e.message || "Unknown error" }),
-        { status: 500, headers: corsHeaders }
+        { status: 500, headers: { ...corsHeaders, "Cache-Control": "no-store" } }
       );
     }
   }
@@ -209,9 +281,11 @@ function triggerSearchPrefetch(ctx, origin, nextToken, limit, corsHeaders) {
 // ★ 403/429 自己修復通信エンジン (内部自動リトライ)
 // =======================================================
 const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const INNERTUBE_TIMEOUT_MS = 8000; // 1回の通信の上限 (固まったまま待ち続けない)
 
-async function callInnerTube(endpoint, payload, retryCount = 0, customSignal = null) {
-  const url = `https://www.youtube.com/youtubei/v1/${endpoint}?key=${INNERTUBE_API_KEY}`;
+async function callInnerTube(endpoint, payload, retryCount = 0, customSignal = null, timeoutMs = INNERTUBE_TIMEOUT_MS) {
+  // prettyPrint=false: 空白なしの軽量JSONで返してもらう (転送量・パース時間を削減)
+  const url = `https://www.youtube.com/youtubei/v1/${endpoint}?key=${INNERTUBE_API_KEY}&prettyPrint=false`;
   
   const headers = {
     "Content-Type": "application/json",
@@ -236,20 +310,27 @@ async function callInnerTube(endpoint, payload, retryCount = 0, customSignal = n
     ...payload
   };
 
+  // タイムアウト (呼び出し側の signal とも連動)
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  const forwardAbort = () => ac.abort();
+  if (customSignal) {
+    if (customSignal.aborted) ac.abort();
+    else customSignal.addEventListener("abort", forwardAbort, { once: true });
+  }
+
   try {
-    const fetchOptions = {
+    const res = await fetch(url, {
       method: "POST",
       keepalive: true,
       headers: headers,
-      body: JSON.stringify(body)
-    };
-    if (customSignal) fetchOptions.signal = customSignal;
-
-    const res = await fetch(url, fetchOptions);
+      body: JSON.stringify(body),
+      signal: ac.signal
+    });
 
     if ((res.status === 403 || res.status === 429) && retryCount < 2) {
       await new Promise(r => setTimeout(r, 60));
-      return await callInnerTube(endpoint, payload, retryCount + 1, customSignal);
+      return await callInnerTube(endpoint, payload, retryCount + 1, customSignal, timeoutMs);
     }
 
     if (!res.ok) {
@@ -260,15 +341,18 @@ async function callInnerTube(endpoint, payload, retryCount = 0, customSignal = n
     return await res.json();
 
   } catch (err) {
-    if (retryCount < 1 && !customSignal?.aborted) {
+    if (retryCount < 1 && !customSignal?.aborted && !ac.signal.aborted) {
       await new Promise(r => setTimeout(r, 60));
-      return await callInnerTube(endpoint, payload, retryCount + 1, customSignal);
+      return await callInnerTube(endpoint, payload, retryCount + 1, customSignal, timeoutMs);
     }
     throw err;
+  } finally {
+    clearTimeout(timer);
+    if (customSignal) customSignal.removeEventListener("abort", forwardAbort);
   }
 }
 
-// チャンネルID解決エンジン (完全キャッシュ化)
+// チャンネルID解決エンジン (完全キャッシュ化 / isolateが入れ替わってもエッジキャッシュから即解決)
 async function resolveChannelId(input) {
   if (!input) return "";
   const clean = input.trim();
@@ -279,11 +363,30 @@ async function resolveChannelId(input) {
     return CHANNEL_ID_CACHE.get(handle);
   }
 
+  const edgeKey = `${CACHE_ORIGIN}/__channel-id/${encodeURIComponent(handle)}`;
+  try {
+    const hit = await caches.default.match(edgeKey);
+    if (hit) {
+      const cachedId = (await hit.text()).trim();
+      if (cachedId.startsWith("UC") && cachedId.length === 24) {
+        CHANNEL_ID_CACHE.set(handle, cachedId);
+        return cachedId;
+      }
+    }
+  } catch (e) {}
+
+  const remember = async (id) => {
+    CHANNEL_ID_CACHE.set(handle, id);
+    try {
+      await caches.default.put(edgeKey, new Response(id, { headers: { "Cache-Control": "public, max-age=2592000" } }));
+    } catch (e) {}
+  };
+
   try {
     const res = await callInnerTube("navigation/resolve_url", { url: `https://www.youtube.com/${handle}` });
     const resolvedId = res.endpoint?.browseEndpoint?.browseId;
     if (resolvedId && resolvedId.startsWith("UC")) {
-      CHANNEL_ID_CACHE.set(handle, resolvedId);
+      await remember(resolvedId);
       return resolvedId;
     }
   } catch (e) {}
@@ -312,7 +415,7 @@ async function resolveChannelId(input) {
     }
     scanChannel(searchData);
     if (foundId) {
-      CHANNEL_ID_CACHE.set(handle, foundId);
+      await remember(foundId);
       return foundId;
     }
   } catch (e) {}
@@ -625,27 +728,91 @@ function parseCommentsFromData(commentData, limit = 30) {
 // =======================================================
 // ★ 3. チャンネル情報 & 各タブ (人気順・古い順対応 ＆ 再生リスト分離)
 // =======================================================
+// ★ チャンネルのタブparams (youtubei.js / 各種ツールで使われている正規値)
+const CHANNEL_TAB_PARAMS = {
+  videos: "EgZ2aWRlb3PyBgQKAjoA",
+  shorts: "EgZzaG9ydHPyBgUKA5oBAA%3D%3D",
+  playlists: "EglwbGF5bGlzdHPyBgQKAkIA"
+};
+
+// タブparams(protobuf)の先頭にあるタブ名 ("videos" / "shorts" / ...) を取り出す。言語に依存しない
+function tabNameFromParams(params) {
+  try {
+    const bin = atob(decodeURIComponent(params).replace(/-/g, "+").replace(/_/g, "/"));
+    if (bin.charCodeAt(0) !== 0x12) return "";
+    const len = bin.charCodeAt(1);
+    const name = bin.substr(2, len);
+    return /^[a-z]+$/.test(name) ? name : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function getChannelTabs(browseData) {
+  const tabs = browseData?.contents?.twoColumnBrowseResultsRenderer?.tabs;
+  if (!Array.isArray(tabs)) return [];
+  const out = [];
+  for (let i = 0; i < tabs.length; i++) {
+    const t = tabs[i]?.tabRenderer;
+    if (!t) continue;
+    const params = t.endpoint?.browseEndpoint?.params || "";
+    out.push({ params, selected: !!t.selected, name: params ? tabNameFromParams(params) : "" });
+  }
+  return out;
+}
+
+// 要求したタブが選択されているか確認し、違えば正しいparamsで取り直す。存在しなければ missing=true
+async function ensureChannelTab(browseData, channelId, tab, usedParams) {
+  const tabs = getChannelTabs(browseData);
+  const selected = tabs.find(t => t.selected);
+  if (!selected || !tabs.some(t => t.name)) return { browseData, missing: false }; // 判定材料が無ければそのまま
+  const selectedName = selected.name || "featured";
+  if (selectedName === tab) return { browseData, missing: false };
+
+  const target = tabs.find(t => t.name === tab);
+  if (!target || !target.params || target.params === usedParams) return { browseData, missing: true };
+  try {
+    const retry = await callInnerTube("browse", { browseId: channelId, params: target.params });
+    const sel2 = getChannelTabs(retry).find(t => t.selected);
+    if (sel2 && (sel2.name || "featured") === tab) return { browseData: retry, missing: false };
+  } catch (e) {}
+  return { browseData, missing: true };
+}
+
+// ショートタブは本物のShortだけ / 動画タブはShortを含めない
+function channelTabAccepts(tab, v) {
+  if (tab === "shorts") return !!v.isShort;
+  if (tab === "videos") return !v.isShort;
+  return true;
+}
+
 async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "latest", limit = 30, continuationToken = null) {
   let browseData = null;
   let channelId = channelInput;
+  let tabMissing = false; // 要求したタブがそのチャンネルに存在しない
 
   if (continuationToken) {
     browseData = await callInnerTube("browse", { continuation: continuationToken });
   } else {
     channelId = await resolveChannelId(channelInput);
     
-    let tabParam = null;
-    if (tab === "videos") tabParam = "Egl2aWRlb3PyBgQKAjoA";
-    else if (tab === "shorts") tabParam = "EgZzaG9ydHPyBgQKAjoA";
-    else if (tab === "playlists") tabParam = "EglwbGF5bGlzdHPyBgQKAjoA";
+    // ★ 正しいタブparams (以前のshortsはVideosタブを指していたため、通常動画が「ショート」として返っていた)
+    const tabParam = CHANNEL_TAB_PARAMS[tab] || null;
 
     const payload = { browseId: channelId };
     if (tabParam) payload.params = tabParam;
 
     browseData = await callInnerTube("browse", payload);
 
+    // ★ 要求したタブが本当に開けたか検証。違えばチャンネル自身のタブ一覧から正しいparamsを取り直す
+    if (tabParam) {
+      const chk = await ensureChannelTab(browseData, channelId, tab, tabParam);
+      browseData = chk.browseData;
+      tabMissing = chk.missing;
+    }
+
     // 人気順・古い順のチップ自動解決
-    if (tab === "videos" && (sort === "popular" || sort === "oldest") && browseData) {
+    if ((tab === "videos" || tab === "shorts") && !tabMissing && (sort === "popular" || sort === "oldest") && browseData) {
       let sortToken = null;
       function findSortChip(node, depth = 0) {
         if (!node || typeof node !== "object" || sortToken || depth > 15) return;
@@ -718,8 +885,7 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
               }
             } else {
               const v = extractVideoRenderer(it);
-              if (v && v.videoId && !seenIds.has(v.videoId)) {
-                if (tab === "shorts") v.isShort = true;
+              if (v && v.videoId && !seenIds.has(v.videoId) && channelTabAccepts(tab, v)) {
                 seenIds.add(v.videoId);
                 items.push(v);
               }
@@ -834,8 +1000,7 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
       }
     } else {
       const v = extractVideoRenderer(node);
-      if (v && v.videoId && !seenIds.has(v.videoId)) {
-        if (tab === "shorts") v.isShort = true;
+      if (v && v.videoId && !seenIds.has(v.videoId) && channelTabAccepts(tab, v)) {
         seenIds.add(v.videoId);
         v.author = author || v.author;
         v.authorId = channelId;
@@ -862,7 +1027,32 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
     }
   }
 
-  scanChannelContents(browseData);
+  if (!tabMissing) scanChannelContents(browseData);
+  else nextContinuation = null;
+
+  // ★ ショートタブは「大量取得」: limitに満たなければ続きページを自動で辿る (最大3回)
+  if (tab === "shorts" && !tabMissing && !continuationToken) {
+    let hops = 0;
+    while (items.length < limit && nextContinuation && hops < 3) {
+      hops++;
+      let more = null;
+      try {
+        more = await fetchInvidiousChannel(channelId, tab, sort, limit - items.length, nextContinuation);
+      } catch (e) { break; }
+      const got = more?.contents || [];
+      for (let i = 0; i < got.length; i++) {
+        const g = got[i];
+        if (!g.videoId || seenIds.has(g.videoId)) continue;
+        seenIds.add(g.videoId);
+        g.author = g.author || author;
+        g.authorId = g.authorId || channelId;
+        g.authorUrl = g.authorUrl || `/channel/${channelId}`;
+        items.push(g);
+      }
+      nextContinuation = more?.continuation || null;
+      if (got.length === 0) break;
+    }
+  }
 
   return {
     author: author,
@@ -886,106 +1076,531 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
 }
 
 // =======================================================
-// ★ 4. ショート動画エンジン (全部 nocookie ＆ 自動再生)
+// ★ 4. ショート動画エンジン v2 (本物のShortsだけ ＆ 大量 ＆ 最速)
+// -------------------------------------------------------
+//  判定 : YouTube自身が「Short」と分類したデータだけを採用する
+//         (reel_watch_sequence / reelItemRenderer / shortsLockupViewModel /
+//          reelWatchEndpoint / SHORTS バッジ)。
+//         「長さが短いだけの通常動画」「タイトルに#shortsが付いた通常動画」は混ざらない。
+//  速度 : 現在のShort (reel_item_watch) と次のShort群 (reel_watch_sequence) を同時に取得。
+//         重い next は最後の保険としてのみ使用。メタ情報は30分キャッシュ ＋ 次の2本を先読み。
+//  大量 : continuation と並列チェーンで limit 件まで一気に収集 (最大120件)。
+//  1分  : 長さが判明しているものは maxSeconds (既定60秒) を超えたら除外。
 // =======================================================
-async function getInitialShortIdFast() {
-  return "9f1rHt0W_Ak";
+const SHORTS_MAX_SECONDS = 60;      // 「1分」。表示丸め対策で+1秒の猶予を持たせて判定
+const SHORTS_DEFAULT_LIMIT = 30;
+const SHORTS_MAX_LIMIT = 120;
+const SHORTS_MAX_SEQ_CALLS = 6;     // 1リクエストで叩く reel_watch_sequence の最大回数 (subrequest 上限対策)
+const SHORTS_BACKFILL_CAP = 6;      // タイトル欠けを oEmbed で補う最大件数
+const SHORTS_SEARCH_PARAMS = "EgIQCQ%3D%3D"; // 検索フィルタ「Shorts」(type=9)
+const SHORT_META_TTL_MS = 30 * 60 * 1000;
+const SHORT_SEED_TTL_MS = 5 * 60 * 1000;
+const SHORT_SEED_FALLBACK = "9f1rHt0W_Ak";
+const SHORT_META_CACHE = new Map();
+let SHORT_SEED_CACHE = { ids: [], time: 0 };
+const DEFAULT_AVATAR = "https://www.gstatic.com/youtube/img/creator/avatar/creator_avatar_default.png";
+
+// 長さが分かっていて maxSeconds を超えるものだけ除外 (長さ不明のShortは YouTube の分類を信頼して通す)
+function passesShortLength(lengthSeconds, maxSeconds) {
+  return !(lengthSeconds > 0 && lengthSeconds > maxSeconds + 1);
 }
 
-async function fetchFastShortWith3Next(videoId) {
-  const nextData = await callInnerTube("next", { videoId });
-
-  let title = "";
-  let author = "";
-  let authorId = "";
-  let authorThumbnails = [];
-  let likeCount = "高評価";
-  const next3Videos = [];
-  const seenIds = new Set([videoId]);
-
-  function scanShort(node, depth = 0) {
-    if (!node || typeof node !== "object" || depth > 15) return;
-
-    if (!title && node.videoPrimaryInfoRenderer?.title) {
-      title = node.videoPrimaryInfoRenderer.title.runs?.map(r => r.text).join("") ||
-              node.videoPrimaryInfoRenderer.title.simpleText || "";
+// レスポンス内からキーを(最初に見つかったもの)探す。overlay など小さなサブツリー専用
+function findKeyDeep(node, key, maxDepth = 12, depth = 0) {
+  if (!node || typeof node !== "object" || depth > maxDepth) return undefined;
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) {
+      const r = findKeyDeep(node[i], key, maxDepth, depth + 1);
+      if (r !== undefined) return r;
     }
+    return undefined;
+  }
+  if (node[key] !== undefined) return node[key];
+  const keys = Object.keys(node);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    if (k === "trackingParams" || k === "clickTrackingParams") continue;
+    const r = findKeyDeep(node[k], key, maxDepth, depth + 1);
+    if (r !== undefined) return r;
+  }
+  return undefined;
+}
 
-    if (node.videoSecondaryInfoRenderer) {
-      const owner = node.videoSecondaryInfoRenderer.owner?.videoOwnerRenderer;
-      if (owner) {
-        if (!author) author = owner.title?.runs?.[0]?.text || "";
-        if (!authorId) authorId = owner.navigationEndpoint?.browseEndpoint?.browseId || "";
-        if (authorThumbnails.length === 0 && owner.thumbnail?.thumbnails) {
-          authorThumbnails = owner.thumbnail.thumbnails.map(t => ({
-            url: fixUrl(t.url),
-            width: t.width || 48,
-            height: t.height || 48
-          }));
-        }
-      }
+// reel_watch_sequence の sequenceParams (protobuf: shortId=1 / params.number=5 / feature2=25)
+// ※ youtubei.js の ReelSequence エンコード結果と完全一致することを検証済み
+function encodeReelSequenceParams(shortId) {
+  const idBytes = new TextEncoder().encode(shortId);
+  const bytes = new Uint8Array([0x0a, idBytes.length, ...idBytes, 0x2a, 0x02, 0x18, 0x05, 0x50, 0x19]);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return encodeURIComponent(btoa(bin));
+}
+
+// Shortsプレイヤーのオーバーレイ (タイトル/チャンネル/いいね/コメント) → メタ情報
+function parseReelOverlayMeta(overlay) {
+  const meta = {};
+  if (!overlay || typeof overlay !== "object") return meta;
+
+  const header = findKeyDeep(overlay, "reelPlayerHeaderRenderer");
+  if (header) {
+    const title = textOf(header.reelTitleText);
+    if (title) meta.title = title;
+    const author = textOf(header.channelTitleText);
+    if (author) meta.author = author;
+    const authorId = header.channelNavigationEndpoint?.browseEndpoint?.browseId;
+    if (authorId) meta.authorId = authorId;
+    const published = textOf(header.timestampText);
+    if (published) meta.publishedText = published;
+    const thumbs = header.channelThumbnail?.thumbnails;
+    if (Array.isArray(thumbs) && thumbs.length > 0) {
+      meta.authorThumbnails = thumbs.map(t => ({ url: fixUrl(t.url), width: t.width || 48, height: t.height || 48 }));
     }
+  }
 
-    if (likeCount === "高評価") {
-      if (node.segmentedLikeDislikeButtonViewModel || node.likeButtonViewModel) {
-        const btn = node.segmentedLikeDislikeButtonViewModel?.likeButtonViewModel?.likeButtonViewModel || node.likeButtonViewModel;
-        const txt = btn?.toggleButtonViewModel?.toggleButtonViewModel?.defaultButtonViewModel?.buttonViewModel?.title || "";
-        if (txt) likeCount = txt;
-      } else if (node.toggleButtonRenderer?.defaultText) {
-        const t = node.toggleButtonRenderer.defaultText;
-        const txt = t.simpleText || t.runs?.map(r => r.text).join("") || "";
-        if (txt && !txt.includes("高評価") && !txt.includes("Like")) likeCount = txt;
-      }
+  const like = findKeyDeep(overlay, "likeButtonRenderer");
+  if (like) {
+    const lt = textOf(like.likeCountText);
+    if (lt) meta.likeCount = lt;
+    else if (typeof like.likeCount === "number") meta.likeCount = String(like.likeCount);
+  }
+
+  const cb = findKeyDeep(overlay, "viewCommentsButton");
+  const ct = textOf(cb?.buttonRenderer?.text);
+  if (ct) meta.commentCount = ct;
+
+  return meta;
+}
+
+// reelWatchEndpoint → 共通のShort項目
+function reelEndpointToItem(ep) {
+  const id = ep?.videoId;
+  if (!isVideoId(id)) return null;
+  const meta = parseReelOverlayMeta(ep.overlay);
+  const thumbs = (ep.thumbnail?.thumbnails || []).map(t => ({ url: fixUrl(t.url), width: t.width || 405, height: t.height || 720 }));
+  return {
+    id: id,
+    videoId: id,
+    title: meta.title || "",
+    author: meta.author || "",
+    authorId: meta.authorId || "",
+    authorUrl: meta.authorId ? `/channel/${meta.authorId}` : "",
+    thumbnail: thumbs.length > 0 ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+    videoThumbnails: thumbs.length > 0 ? thumbs : makeReliableThumbnails(id),
+    embedUrl: makeShortNocookieEmbedUrl(id),
+    isShort: true,
+    type: "short",
+    lengthSeconds: 0,
+    viewCountText: "",
+    publishedText: meta.publishedText || ""
+  };
+}
+
+function parseReelSequenceResponse(data) {
+  const items = [];
+  const entries = Array.isArray(data?.entries) ? data.entries : [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const ep = e?.command?.reelWatchEndpoint || e?.innertubeCommand?.reelWatchEndpoint || e?.reelWatchEndpoint;
+    const it = reelEndpointToItem(ep);
+    if (it) items.push(it);
+  }
+  const token = data?.continuationEndpoint?.continuationCommand?.token || null;
+  return { items, continuation: token };
+}
+
+async function fetchReelSequencePage(seedId, token) {
+  let data;
+  if (token) {
+    try {
+      data = await callInnerTube("reel/reel_watch_sequence", { sequenceParams: token });
+    } catch (e) {
+      data = await callInnerTube("reel/reel_watch_sequence", { continuation: token });
     }
+  } else {
+    data = await callInnerTube("reel/reel_watch_sequence", { sequenceParams: encodeReelSequenceParams(seedId) });
+  }
+  return parseReelSequenceResponse(data);
+}
 
-    if (next3Videos.length < 3) {
-      const v = extractVideoRenderer(node);
-      if (v && v.videoId && !seenIds.has(v.videoId) && v.isShort) {
-        seenIds.add(v.videoId);
-        next3Videos.push({
-          id: v.videoId,
-          title: v.title,
-          author: v.author || "YouTube Creator",
-          thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-          embedUrl: makeShortNocookieEmbedUrl(v.videoId)
-        });
+// ★ 大量収集: 主チェーン(continuation)に加えて、集めたShortを種にした並列チェーンも同時に走らせる
+async function collectShortsSequence({ seedId, token, limit, maxSeconds }) {
+  const out = [];
+  const seen = new Set([seedId]);
+  let primaryToken = null;
+  let lastError = null;
+  let calls = 0;
+  let fannedOut = false;
+  let chains = [token ? { token, primary: true } : { seed: seedId, primary: true }];
+
+  while (out.length < limit && chains.length > 0 && calls < SHORTS_MAX_SEQ_CALLS) {
+    const batch = chains.slice(0, SHORTS_MAX_SEQ_CALLS - calls);
+    calls += batch.length;
+    const results = await Promise.allSettled(batch.map(c => fetchReelSequencePage(c.seed, c.token)));
+
+    const nextChains = [];
+    const fresh = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const c = batch[i];
+      if (r.status !== "fulfilled") { lastError = r.reason; continue; }
+      for (let j = 0; j < r.value.items.length; j++) {
+        const it = r.value.items[j];
+        if (seen.has(it.id)) continue;
+        if (!passesShortLength(it.lengthSeconds, maxSeconds)) continue;
+        seen.add(it.id);
+        out.push(it);
+        fresh.push(it);
       }
+      if (c.primary) primaryToken = r.value.continuation || null;
+      if (r.value.continuation) nextChains.push({ token: r.value.continuation, primary: c.primary });
     }
+    chains = nextChains;
 
-    if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) {
-        if (next3Videos.length >= 3 && title && author && likeCount !== "高評価") break;
-        scanShort(node[i], depth + 1);
-      }
-    } else {
-      const keys = Object.keys(node);
-      for (let i = 0; i < keys.length; i++) {
-        if (next3Videos.length >= 3 && title && author && likeCount !== "高評価") break;
-        const k = keys[i];
-        if (k !== "trackingParams" && k !== "serviceTrackingParams") scanShort(node[k], depth + 1);
+    // 足りなければ、取れたShortを種にした別チェーンを2本追加 (並列)。
+    // 続きページ(token有り)では前ページと重複しないよう、主チェーンの続きだけを辿る
+    if (!fannedOut && !token && out.length < limit && fresh.length >= 3) {
+      fannedOut = true;
+      const picks = [fresh[Math.floor(fresh.length / 3)], fresh[Math.floor((fresh.length * 2) / 3)]];
+      for (let i = 0; i < picks.length; i++) {
+        const p = picks[i];
+        if (p && !chains.some(ch => ch.seed === p.id)) chains.push({ seed: p.id, primary: false });
       }
     }
   }
 
-  scanShort(nextData);
+  return { items: out, continuation: primaryToken, calls, error: out.length > 0 ? null : lastError };
+}
 
+// ---- メタ情報 (現在のShort) ----
+function getShortMetaCached(videoId) {
+  const it = SHORT_META_CACHE.get(videoId);
+  if (it && Date.now() - it.time < SHORT_META_TTL_MS) return it.data;
+  return null;
+}
+
+function setShortMetaCache(videoId, data) {
+  SHORT_META_CACHE.delete(videoId);
+  if (SHORT_META_CACHE.size > 500) SHORT_META_CACHE.delete(SHORT_META_CACHE.keys().next().value);
+  SHORT_META_CACHE.set(videoId, { data, time: Date.now() });
+}
+
+function mergeMeta(primary, fallback) {
+  if (!primary && !fallback) return null;
+  const out = { ...(fallback || {}) };
+  const p = primary || {};
+  for (const k of Object.keys(p)) {
+    if (p[k] !== undefined && p[k] !== "") out[k] = p[k];
+  }
+  return out;
+}
+
+// ① 最速: 軽量な reel_item_watch (プレイヤー応答なし) だけでメタ情報を取る
+async function fetchShortMetaViaReel(videoId) {
+  const call = (disablePlayerResponse) => callInnerTube("reel/reel_item_watch", {
+    playerRequest: { videoId },
+    params: "CAUwAg%3D%3D",
+    disablePlayerResponse
+  });
+  let data = await call(true);
+  if (!data?.overlay) data = await call(false); // 念のため: オーバーレイが無ければプレイヤー応答つきで再取得
+  const meta = parseReelOverlayMeta(data?.overlay);
+
+  // プレイヤー応答があれば長さ・タイトルを補完 (「1分」判定に使える)
+  const vd = data?.playerResponse?.videoDetails;
+  if (vd) {
+    if (!meta.title && vd.title) meta.title = vd.title;
+    if (!meta.author && vd.author) meta.author = vd.author;
+    if (!meta.authorId && vd.channelId) meta.authorId = vd.channelId;
+    const len = parseInt(vd.lengthSeconds, 10);
+    if (len > 0) meta.lengthSeconds = len;
+  }
+  return Object.keys(meta).length > 0 ? meta : null;
+}
+
+// ② 保険: oEmbed (超軽量 GET / エッジで1日キャッシュ)
+async function fetchShortOEmbed(videoId) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 4000);
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/oembed?format=json&url=${encodeURIComponent("https://www.youtube.com/shorts/" + videoId)}`,
+      { signal: ac.signal, cf: { cacheTtl: 86400, cacheEverything: true } }
+    );
+    if (!res.ok) return null;
+    const j = await res.json();
+    if (!j || !j.title) return null;
+    const hm = typeof j.author_url === "string" ? j.author_url.match(/youtube\.com\/(@[^/?#]+)/) : null;
+    return {
+      title: j.title,
+      author: j.author_name || "",
+      authorHandle: hm ? decodeURIComponent(hm[1]) : ""
+    };
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ③ 最後の保険: 従来どおり next から取得 (重い)
+async function fetchShortMetaViaNext(videoId) {
+  const nextData = await callInnerTube("next", { videoId });
+  const meta = {};
+
+  function scan(node, depth = 0) {
+    if (!node || typeof node !== "object" || depth > 15) return;
+
+    if (!meta.title && node.videoPrimaryInfoRenderer?.title) {
+      meta.title = textOf(node.videoPrimaryInfoRenderer.title);
+    }
+    const owner = node.videoSecondaryInfoRenderer?.owner?.videoOwnerRenderer;
+    if (owner) {
+      if (!meta.author) meta.author = owner.title?.runs?.[0]?.text || "";
+      if (!meta.authorId) meta.authorId = owner.navigationEndpoint?.browseEndpoint?.browseId || "";
+      if (!meta.authorThumbnails && owner.thumbnail?.thumbnails) {
+        meta.authorThumbnails = owner.thumbnail.thumbnails.map(t => ({ url: fixUrl(t.url), width: t.width || 48, height: t.height || 48 }));
+      }
+    }
+    if (!meta.likeCount) {
+      if (node.segmentedLikeDislikeButtonViewModel || node.likeButtonViewModel) {
+        const btn = node.segmentedLikeDislikeButtonViewModel?.likeButtonViewModel?.likeButtonViewModel || node.likeButtonViewModel;
+        const txt = btn?.toggleButtonViewModel?.toggleButtonViewModel?.defaultButtonViewModel?.buttonViewModel?.title || "";
+        if (txt) meta.likeCount = txt;
+      } else if (node.toggleButtonRenderer?.defaultText) {
+        const txt = textOf(node.toggleButtonRenderer.defaultText);
+        if (txt && !txt.includes("高評価") && !txt.includes("Like")) meta.likeCount = txt;
+      }
+    }
+
+    const done = () => meta.title && meta.author && meta.likeCount;
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) {
+        if (done()) break;
+        scan(node[i], depth + 1);
+      }
+    } else {
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i++) {
+        if (done()) break;
+        const k = keys[i];
+        if (k !== "trackingParams" && k !== "serviceTrackingParams") scan(node[k], depth + 1);
+      }
+    }
+  }
+  scan(nextData);
+  return meta.title ? meta : null;
+}
+
+// メタ情報取得 (キャッシュ → reel_item_watch → oEmbed → next の順)
+async function getShortMeta(videoId) {
+  const cached = getShortMetaCached(videoId);
+  if (cached) return cached;
+
+  let meta = await fetchShortMetaViaReel(videoId).catch(() => null);
+  if (!meta || !meta.title) {
+    const o = await fetchShortOEmbed(videoId);
+    meta = mergeMeta(meta, o);
+  }
+  if (!meta || !meta.title) {
+    const n = await fetchShortMetaViaNext(videoId).catch(() => null);
+    meta = mergeMeta(meta, n);
+  }
+  if (meta && meta.title) setShortMetaCache(videoId, meta);
+  return meta;
+}
+
+function buildShortCurrent(videoId, meta) {
+  const m = meta || {};
+  const handle = m.authorHandle || "";
   return {
+    id: videoId,
+    videoId: videoId,
+    title: m.title || "Shorts",
+    author: m.author || "YouTube Creator",
+    authorId: m.authorId || "",
+    authorUrl: m.authorId ? `/channel/${m.authorId}` : (handle ? `/channel/${handle}` : ""),
+    authorThumbnails: m.authorThumbnails && m.authorThumbnails.length > 0
+      ? m.authorThumbnails
+      : [{ url: DEFAULT_AVATAR, width: 48, height: 48 }],
+    likeCount: m.likeCount || "高評価",
+    commentCount: m.commentCount || "コメント",
+    publishedText: m.publishedText || "",
+    viewCountText: m.viewCountText || "",
+    lengthSeconds: m.lengthSeconds || 0,
+    isShort: true,
+    type: "short",
+    embedUrl: makeShortNocookieEmbedUrl(videoId),
+    videoThumbnails: makeReliableThumbnails(videoId)
+  };
+}
+
+// タイトルが取れなかった項目だけ oEmbed で補完 (並列・最大 SHORTS_BACKFILL_CAP 件)
+async function backfillShortTitles(items) {
+  const targets = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.title) continue;
+    const cached = getShortMetaCached(it.id);
+    if (cached) {
+      it.title = cached.title || it.title;
+      it.author = it.author || cached.author || "";
+      it.authorId = it.authorId || cached.authorId || "";
+      continue;
+    }
+    if (targets.length < SHORTS_BACKFILL_CAP) targets.push(it);
+  }
+  if (targets.length === 0) return;
+  await Promise.allSettled(targets.map(async (it) => {
+    const o = await fetchShortOEmbed(it.id);
+    if (o) {
+      it.title = o.title;
+      it.author = it.author || o.author || "";
+    }
+  }));
+}
+
+// 次に再生されそうな Short のメタ情報を裏で温めておく (スワイプ直後も 0ms)
+function prefetchShortMetas(ctx, ids) {
+  if (!ctx || typeof ctx.waitUntil !== "function") return;
+  const targets = ids.filter(id => !getShortMetaCached(id));
+  if (targets.length === 0) return;
+  ctx.waitUntil(Promise.allSettled(targets.map(id => getShortMeta(id))));
+}
+
+// ---- Shortsだけに絞った検索 (フォールバック / おすすめの種 / type=shorts) ----
+async function fetchShortsSearch(query, limit = 30, continuationToken = null, maxSeconds = SHORTS_MAX_SECONDS) {
+  const results = [];
+  const seen = new Set();
+  let token = continuationToken;
+  let first = !continuationToken;
+  let pages = 0;
+
+  while (pages < 3 && results.length < limit) {
+    pages++;
+    const payload = first ? { query, params: SHORTS_SEARCH_PARAMS } : { continuation: token };
+    const data = await callInnerTube("search", payload);
+    first = false;
+
+    (function scan(node, depth) {
+      if (!node || typeof node !== "object" || results.length >= limit || depth > 24) return;
+      const v = extractVideoRenderer(node);
+      if (v && v.videoId && v.isShort && !seen.has(v.videoId) && passesShortLength(v.lengthSeconds, maxSeconds)) {
+        seen.add(v.videoId);
+        results.push(v);
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) scan(node[i], depth + 1);
+      } else {
+        const keys = Object.keys(node);
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i];
+          if (k !== "trackingParams" && k !== "serviceTrackingParams") scan(node[k], depth + 1);
+        }
+      }
+    })(data, 0);
+
+    token = extractContinuationToken(data);
+    if (!token) break;
+  }
+
+  return { type: "shorts", results, continuation: token || null };
+}
+
+// ルート(/api/v1/shorts)用: 種になるShort。検索で拾って5分キャッシュ、取れなければ固定ID
+async function getShortsSeed() {
+  const now = Date.now();
+  if (SHORT_SEED_CACHE.ids.length > 0 && now - SHORT_SEED_CACHE.time < SHORT_SEED_TTL_MS) {
+    return SHORT_SEED_CACHE.ids[Math.floor(Math.random() * SHORT_SEED_CACHE.ids.length)];
+  }
+  try {
+    const s = await fetchShortsSearch("#shorts", 20, null, SHORTS_MAX_SECONDS);
+    const ids = s.results.map(r => r.videoId).filter(isVideoId);
+    if (ids.length > 0) {
+      SHORT_SEED_CACHE = { ids, time: now };
+      return ids[Math.floor(Math.random() * ids.length)];
+    }
+  } catch (e) {}
+  return SHORT_SEED_FALLBACK;
+}
+
+// ★ メイン: /api/v1/shorts/:id
+async function fetchShortsFeed(seedId, opts = {}) {
+  const limit = opts.limit || SHORTS_DEFAULT_LIMIT;
+  const token = opts.continuation || null;
+  const maxSeconds = opts.maxSeconds || SHORTS_MAX_SECONDS;
+  const ctx = opts.ctx || null;
+
+  if (!isVideoId(seedId)) throw new Error("ショート動画IDが不正です");
+
+  // 現在のShortのメタ情報 と 次のShort群 を「同時に」取得 (追加読み込み時はメタ通信なし)
+  const metaP = token ? Promise.resolve(getShortMetaCached(seedId)) : getShortMeta(seedId).catch(() => null);
+  const seqP = collectShortsSequence({ seedId, token, limit, maxSeconds })
+    .catch(e => ({ items: [], continuation: null, calls: 0, error: e }));
+  const [meta, seq] = await Promise.all([metaP, seqP]);
+
+  let items = seq.items;
+  let continuation = seq.continuation;
+  let source = "reel";
+  let warning = "";
+
+  // フォールバック: reelシーケンスが取れないときは「Shortsだけに絞った検索」で補う
+  if (!token && items.length < Math.min(3, limit)) {
+    if (seq.error) warning = "reel_watch_sequence: " + (seq.error.message || String(seq.error));
+    try {
+      const q = (meta?.title || "").slice(0, 40) || "#shorts";
+      const s = await fetchShortsSearch(q, limit, null, maxSeconds);
+      const seen = new Set([seedId, ...items.map(i => i.id)]);
+      for (let i = 0; i < s.results.length; i++) {
+        const r = s.results[i];
+        if (seen.has(r.videoId)) continue;
+        seen.add(r.videoId);
+        items.push({
+          id: r.videoId, videoId: r.videoId, title: r.title, author: r.author, authorId: r.authorId,
+          authorUrl: r.authorUrl, thumbnail: r.thumbnail, videoThumbnails: r.videoThumbnails,
+          embedUrl: makeShortNocookieEmbedUrl(r.videoId), isShort: true, type: "short",
+          lengthSeconds: r.lengthSeconds || 0, viewCountText: r.viewCountText || "", publishedText: r.publishedText || ""
+        });
+      }
+      if (s.results.length > 0) { source = "search"; continuation = null; }
+    } catch (e) {}
+  }
+
+  await backfillShortTitles(items);
+
+  if (!meta && items.length === 0) {
+    throw new Error(seq.error?.message || "ショート動画を取得できませんでした");
+  }
+
+  if (!token) prefetchShortMetas(ctx, items.slice(0, 2).map(i => i.id));
+
+  const out = {
     status: "success",
     type: "shorts",
-    current: {
-      id: videoId,
-      title: title || "Shorts",
-      author: author || "YouTube Creator",
-      authorId: authorId,
-      authorUrl: authorId ? `/channel/${authorId}` : "",
-      authorThumbnails: authorThumbnails.length > 0 ? authorThumbnails : [{ url: "https://www.gstatic.com/youtube/img/creator/avatar/creator_avatar_default.png", width: 48, height: 48 }],
-      likeCount: likeCount,
-      commentCount: "コメント",
-      embedUrl: makeShortNocookieEmbedUrl(videoId),
-      videoThumbnails: makeReliableThumbnails(videoId)
-    },
-    sequence: next3Videos
+    source: source,
+    current: buildShortCurrent(seedId, meta),
+    sequence: items,
+    count: items.length,
+    continuation: continuation
   };
+  if (warning) out.warning = warning;
+  return out;
+}
+
+// ---- 次ページの先読み (スワイプ/続き読み込みを 0ms にする) ----
+function shortsPageKey(token, limit, maxSeconds) {
+  return `shorts_page_${String(token).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 240)}_${limit}_${maxSeconds}`;
+}
+
+function triggerShortsPrefetch(ctx, seedId, token, limit, maxSeconds) {
+  if (!token || !ctx || typeof ctx.waitUntil !== "function") return;
+  const key = shortsPageKey(token, limit, maxSeconds);
+  if (getCached(key)) return;
+  ctx.waitUntil((async () => {
+    try {
+      const data = await fetchShortsFeed(seedId, { limit, continuation: token, maxSeconds, ctx: null });
+      if (data && data.sequence && data.sequence.length > 0) setCache(key, data);
+    } catch (e) {}
+  })());
 }
 
 // =======================================================
@@ -1038,6 +1653,12 @@ function extractVideoRenderer(rawNode) {
     node = node.richItemRenderer.content;
   }
 
+  // ★ 新形式のShort (チャンネルのショートタブ / Shorts棚 / 検索)
+  if (node.shortsLockupViewModel) {
+    const s = parseShortsLockup(node.shortsLockupViewModel);
+    if (s) return s;
+  }
+
   const vr = node.compactVideoRenderer || node.videoRenderer || node.gridVideoRenderer || node.playlistVideoRenderer ||
              (node.videoId && (node.title || node.headline) ? node : null);
 
@@ -1046,7 +1667,8 @@ function extractVideoRenderer(rawNode) {
     const lengthText = vr.lengthText?.simpleText || vr.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText || "";
     const lengthSeconds = parseLengthToSeconds(lengthText);
     const title = vr.title?.runs?.map(r => r.text).join("") || vr.title?.simpleText || "";
-    const isShort = (lengthSeconds > 0 && lengthSeconds <= 61) || title.toLowerCase().includes("#shorts");
+    // ★ Short判定は YouTube 自身の構造シグナルのみ (長さ・タイトルの"#shorts"での推測はしない)
+    const isShort = isShortRenderer(vr);
 
     const realThumbnails = (vr.thumbnail?.thumbnails || []).map(t => ({
       url: fixUrl(t.url),
@@ -1074,7 +1696,8 @@ function extractVideoRenderer(rawNode) {
 
   const lvm = node.lockupViewModel || (node.contentId && node.metadata ? node : null);
   if (lvm) {
-    const videoId = lvm.contentId || lvm.rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint?.videoId || lvm.rendererContext?.commandContext?.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId;
+    const onTapCmd = lvm.rendererContext?.commandContext?.onTap?.innertubeCommand;
+    const videoId = lvm.contentId || onTapCmd?.watchEndpoint?.videoId || onTapCmd?.reelWatchEndpoint?.videoId;
     if (videoId && typeof videoId === "string" && videoId.length === 11) {
       const meta = lvm.metadata?.lockupMetadataViewModel;
       const rows = meta?.metadataRows || [];
@@ -1090,7 +1713,8 @@ function extractVideoRenderer(rawNode) {
         if (bText && (bText.includes(":") || /^\d+$/.test(bText))) { lengthText = bText; break; }
       }
       const lengthSeconds = parseLengthToSeconds(lengthText);
-      const isShort = lvm.contentType === "LOCKUP_CONTENT_TYPE_SHORTS" || (lengthSeconds > 0 && lengthSeconds <= 61) || title.toLowerCase().includes("#shorts");
+      // ★ コンテンツ種別 / タップ先が Shorts のときだけ Short (長さ・タイトルでは判定しない)
+      const isShort = /SHORT/i.test(lvm.contentType || "") || hasReelEndpoint(onTapCmd);
 
       const imgSources = lvm.contentImage?.thumbnailViewModel?.image?.sources || [];
       const realThumbnails = imgSources.map(s => ({ url: fixUrl(s.url), width: s.width || 320, height: s.height || 180 }));
@@ -1129,7 +1753,7 @@ function extractVideoRenderer(rawNode) {
         authorUrl: "",
         thumbnail: thumbs.length > 0 ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${vId}/hqdefault.jpg`,
         videoThumbnails: thumbs.length > 0 ? thumbs : makeReliableThumbnails(vId),
-        lengthSeconds: 30,
+        lengthSeconds: 0, // Shortの一覧では長さが提供されない (以前の固定値30は誤情報だったため廃止)
         viewCountText: r.viewCountText?.simpleText || "",
         viewCount: parseCount(r.viewCountText?.simpleText || ""),
         publishedText: "",
@@ -1139,6 +1763,80 @@ function extractVideoRenderer(rawNode) {
   }
 
   return null;
+}
+
+// ---- Short 判定ヘルパー ----
+function isVideoId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9_-]{11}$/.test(id);
+}
+
+// {simpleText} / {runs:[{text}]} / {content} のどれからでも文字列を取り出す
+function textOf(t) {
+  if (!t) return "";
+  if (typeof t === "string") return t;
+  if (typeof t.simpleText === "string") return t.simpleText;
+  if (typeof t.content === "string") return t.content;
+  if (Array.isArray(t.runs)) return t.runs.map(r => r?.text || "").join("");
+  return "";
+}
+
+// 遷移先が Shorts (reelWatchEndpoint / /shorts/ URL / SHORTSページ) か
+function hasReelEndpoint(ep) {
+  if (!ep || typeof ep !== "object") return false;
+  if (ep.reelWatchEndpoint) return true;
+  const m = ep.commandMetadata?.webCommandMetadata;
+  if (m) {
+    if (m.webPageType === "WEB_PAGE_TYPE_SHORTS") return true;
+    if (typeof m.url === "string" && m.url.startsWith("/shorts/")) return true;
+  }
+  return false;
+}
+
+// サムネイル左下のバッジが「SHORTS」スタイルか
+function hasShortsOverlayStyle(overlays) {
+  if (!Array.isArray(overlays)) return false;
+  for (let i = 0; i < overlays.length; i++) {
+    if (overlays[i]?.thumbnailOverlayTimeStatusRenderer?.style === "SHORTS") return true;
+  }
+  return false;
+}
+
+function isShortRenderer(vr) {
+  if (!vr || typeof vr !== "object") return false;
+  return hasReelEndpoint(vr.navigationEndpoint) || hasShortsOverlayStyle(vr.thumbnailOverlays);
+}
+
+// shortsLockupViewModel (チャンネルのショートタブ・Shorts棚) → 共通形式
+function parseShortsLockup(slvm) {
+  if (!slvm || typeof slvm !== "object") return null;
+  let id = slvm.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId ||
+           slvm.inlinePlayerData?.onVisible?.innertubeCommand?.watchEndpoint?.videoId || "";
+  if (!isVideoId(id) && typeof slvm.entityId === "string") {
+    id = slvm.entityId.replace(/^shorts-shelf-item-/, "");
+  }
+  if (!isVideoId(id)) return null;
+
+  const title = textOf(slvm.overlayMetadata?.primaryText) || slvm.accessibilityText || "";
+  const viewCountText = textOf(slvm.overlayMetadata?.secondaryText);
+  const thumbs = (slvm.thumbnail?.sources || slvm.thumbnail?.thumbnails || [])
+    .map(t => ({ url: fixUrl(t.url), width: t.width || 405, height: t.height || 720 }));
+
+  return {
+    videoId: id,
+    isShort: true,
+    type: "short",
+    title: title,
+    author: "",
+    authorId: "",
+    authorUrl: "",
+    thumbnail: thumbs.length > 0 ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+    videoThumbnails: thumbs.length > 0 ? thumbs : makeReliableThumbnails(id),
+    lengthSeconds: 0,
+    viewCountText: viewCountText,
+    viewCount: parseCount(viewCountText),
+    publishedText: "",
+    embedUrl: makeShortNocookieEmbedUrl(id)
+  };
 }
 
 function makeReliableThumbnails(videoId) {
@@ -1360,6 +2058,7 @@ function renderDemoHtml(origin) {
     .shorts-sequence-list { flex: 1; min-width: 250px; }
     .seq-card { display: flex; gap: 10px; margin-bottom: 8px; background: #222; padding: 8px; border-radius: 6px; cursor: pointer; }
     .seq-card img { width: 45px; height: 80px; object-fit: cover; border-radius: 4px; }
+    #sequenceList { max-height: 560px; overflow: auto; }
     pre { background: #151515; padding: 12px; border-radius: 6px; overflow: auto; max-height: 450px; color: #00ff66; font-size: 12px; }
   </style>
 </head>
@@ -1406,7 +2105,7 @@ function renderDemoHtml(origin) {
         </div>
       </div>
       <div class="shorts-sequence-list">
-        <h4>次のショート:</h4>
+        <h4>次のショート: <span id="sequenceCount">0</span>件</h4>
         <div id="sequenceList"></div>
       </div>
     </div>
@@ -1431,7 +2130,7 @@ function renderDemoHtml(origin) {
 
       if (m === 'search') input.value = '/api/v1/search?q=Hikakin';
       if (m === 'channel') input.value = '/api/v1/channels/@HikakinTV?tab=' + currentTab + '&sort=' + currentSort;
-      if (m === 'shorts') input.value = '/api/v1/shorts/9f1rHt0W_Ak';
+      if (m === 'shorts') input.value = '/api/v1/shorts/9f1rHt0W_Ak?limit=40';
       if (m === 'video') input.value = '/api/v1/videos/SX_ViT4Ra7k';
       if (m === 'comments') input.value = '/api/v1/comments/SX_ViT4Ra7k';
       if (m === 'playlist') input.value = '/api/v1/playlists/PLoSWVnSA9vG8hI-SUpAimvYJrPh-PRRvp';
@@ -1457,6 +2156,40 @@ function renderDemoHtml(origin) {
       fetchApi();
     }
 
+    let shortsState = { id: '', continuation: null, seen: {} };
+
+    // 次のショート一覧 (textContentで描画: タイトルにHTMLが含まれても安全 / 重複IDは表示しない)
+    function renderSequence(list, append) {
+      var box = document.getElementById('sequenceList');
+      if (!append) { box.textContent = ''; shortsState.seen = {}; }
+      (list || []).forEach(function (s) {
+        if (shortsState.seen[s.id]) return;
+        shortsState.seen[s.id] = true;
+        var card = document.createElement('div');
+        card.className = 'seq-card';
+        card.onclick = function () {
+          document.getElementById('pathInput').value = '/api/v1/shorts/' + s.id + '?limit=40';
+          fetchApi();
+        };
+        var img = document.createElement('img');
+        img.src = s.thumbnail || '';
+        img.loading = 'lazy';
+        var info = document.createElement('div');
+        var b = document.createElement('b');
+        b.textContent = s.title || s.id;
+        var sp = document.createElement('span');
+        sp.style.color = '#aaa';
+        sp.textContent = s.author || '';
+        info.appendChild(b);
+        info.appendChild(document.createElement('br'));
+        info.appendChild(sp);
+        card.appendChild(img);
+        card.appendChild(info);
+        box.appendChild(card);
+      });
+      document.getElementById('sequenceCount').textContent = String(box.children.length);
+    }
+
     async function fetchApi() {
       const p = document.getElementById('pathInput').value.trim();
       const resEl = document.getElementById('result');
@@ -1474,15 +2207,12 @@ function renderDemoHtml(origin) {
 
         if (json.type === 'shorts' && json.current) {
           shortsView.style.display = 'block';
-          shortsIframe.src = json.current.embedUrl;
+          document.getElementById('shortsIframe').src = json.current.embedUrl;
           document.getElementById('shortTitleDisplay').textContent = json.current.title;
           document.getElementById('shortAuthorDisplay').textContent = json.current.author;
-          document.getElementById('sequenceList').innerHTML = (json.sequence || []).map(s => \`
-            <div class="seq-card" onclick="document.getElementById('pathInput').value='/api/v1/shorts/\${s.id}'; fetchApi();">
-              <img src="\${s.thumbnail}">
-              <div><b>\${s.title}</b><br><span style="color:#aaa">\${s.author}</span></div>
-            </div>
-          \`).join('');
+          shortsState.id = json.current.id;
+          shortsState.continuation = json.continuation || null;
+          renderSequence(json.sequence, false);
         } else {
           shortsView.style.display = 'none';
         }
@@ -1504,6 +2234,8 @@ function renderDemoHtml(origin) {
         endpoint = '/api/v1/channels/@HikakinTV?continuation=' + encodeURIComponent(lastToken) + '&tab=' + currentTab + '&sort=' + currentSort;
       } else if (currentMode === 'comments') {
         endpoint = '/api/v1/comments/SX_ViT4Ra7k?continuation=' + encodeURIComponent(lastToken);
+      } else if (currentMode === 'shorts') {
+        endpoint = '/api/v1/shorts/' + shortsState.id + '?limit=40&continuation=' + encodeURIComponent(lastToken);
       }
 
       try {
@@ -1513,6 +2245,7 @@ function renderDemoHtml(origin) {
         resEl.textContent = '【追加読込時間: ' + Math.round(t1 - t0) + ' ms】\\n' + JSON.stringify(json, null, 2);
         lastToken = json.continuation || null;
         document.getElementById('btnNext').style.display = lastToken ? 'inline-block' : 'none';
+        if (currentMode === 'shorts' && json.sequence) renderSequence(json.sequence, true);
       } catch (e) {
         resEl.textContent = '追加読み込みエラー: ' + e.message;
       }
